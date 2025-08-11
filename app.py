@@ -1,59 +1,76 @@
 import streamlit as st
-from pathlib import Path
 import pandas as pd
-from src.stage1 import make_csvs_from_excels
-from src.stage2 import build_master_dataset
+from src.drive_utils import (
+    drive_client, list_files_in_folder, upload_bytes,
+    convert_all_xlsx_in_folder_to_csv, load_csv_from_drive,
+    XLSX_MIME, CSV_MIME
+)
 
-st.set_page_config(page_title="Thunderbolt ⚡ — Stage 1 & 2", layout="wide")
-st.title("Project Thunderbolt — Stage 1 & 2")
+st.set_page_config(page_title="Thunderbolt ⚡ — GDrive Pipeline", layout="wide")
+st.title("Project Thunderbolt — Google Drive Data Pipeline")
 
-# workspace folders (persist in the repo)
-WORKDIR = Path("./workspace")
-EXCEL_DIR = WORKDIR / "excels"
-CSV_DIR   = WORKDIR / "steamfield_csvs"
-for p in (EXCEL_DIR, CSV_DIR):
-    p.mkdir(parents=True, exist_ok=True)
+RAW_XLSX_FOLDER_ID = st.secrets.get("RAW_XLSX_FOLDER_ID", "")
+CSV_FOLDER_ID      = st.secrets.get("CSV_FOLDER_ID", "")
 
-tab1, tab2 = st.tabs(["Stage 1: Excel → CSV", "Stage 2: Merge & Clean"])
+with st.sidebar:
+    st.subheader("Google Drive Folders")
+    RAW_XLSX_FOLDER_ID = st.text_input("RAW_XLSX_FOLDER_ID", value=RAW_XLSX_FOLDER_ID)
+    CSV_FOLDER_ID      = st.text_input("CSV_FOLDER_ID", value=CSV_FOLDER_ID)
 
-with tab1:
-    st.subheader("Upload Daily Generation Report Excel files")
-    uploads = st.file_uploader(
-        "Upload .xlsx (pattern: 'Daily Generation Report_*.xlsx')",
-        type=["xlsx"], accept_multiple_files=True
-    )
-    col_a, col_b = st.columns([1,1])
-    with col_a:
-        if uploads and st.button("Save uploads"):
-            for uf in uploads:
-                (EXCEL_DIR / uf.name).write_bytes(uf.read())
-            st.success(f"Saved {len(uploads)} file(s) to {EXCEL_DIR}")
+try:
+    drv = drive_client()
+    st.sidebar.success("Drive auth OK")
+except Exception as e:
+    drv = None
+    st.sidebar.error(f"Drive auth error: {e}")
 
-    with col_b:
-        if st.button("Run Stage 1 (make CSVs)"):
-            new_csvs = make_csvs_from_excels(EXCEL_DIR, CSV_DIR)
-            st.success(f"Stage 1 done. New CSVs: {len(new_csvs)}")
-            if new_csvs:
-                st.write([p.name for p in new_csvs])
+tab_up, tab_conv, tab_csv, tab_an = st.tabs([
+    "1) Upload XLSX → Drive", "2) Convert RAW → CSV", "3) Browse CSVs", "4) Analyze CSVs"
+])
 
-    st.caption(f"Excel dir: {EXCEL_DIR.resolve()}")
-    st.caption(f"CSV dir: {CSV_DIR.resolve()}")
-
-with tab2:
-    st.subheader("Build Master Dataset")
-    fmt = st.selectbox("Timestamp display format",
-                       ["%d-%m-%Y %H%MH", "%d-%m-%Y %H:%M", "%Y-%m-%d %H:%M"],
-                       index=0)
-    if st.button("Run Stage 2 (merge & clean)"):
-        master = build_master_dataset(CSV_DIR, timestamp_format=fmt)
-        if master.empty:
-            st.warning("No valid Steamfield CSVs found. Run Stage 1 first.")
+with tab_up:
+    st.subheader("Upload .xlsx to RAW folder in Drive")
+    files = st.file_uploader("XLSX only", type=["xlsx"], accept_multiple_files=True)
+    if st.button("Upload to Drive"):
+        if not drv or not RAW_XLSX_FOLDER_ID:
+            st.error("Missing Drive auth or RAW folder ID")
         else:
-            st.success(f"Master dataset ready. Rows: {len(master)}  |  Cols: {len(master.columns)}")
-            st.dataframe(master.head(50))
-            st.download_button(
-                "Download master.csv",
-                master.to_csv(index=False),
-                "master.csv",
-                "text/csv"
-            )
+            n = 0
+            for f in files or []:
+                upload_bytes(drv, RAW_XLSX_FOLDER_ID, data=f.read(), filename=f.name, mime_type=XLSX_MIME)
+                n += 1
+            st.success(f"Uploaded {n} file(s) to RAW")
+
+    if drv and RAW_XLSX_FOLDER_ID:
+        st.caption("RAW contents:")
+        st.dataframe(pd.DataFrame(list_files_in_folder(drv, RAW_XLSX_FOLDER_ID, XLSX_MIME)))
+
+with tab_conv:
+    st.subheader("Convert all RAW XLSX → CSV (stored in CSV folder)")
+    if st.button("Run conversion"):
+        if not drv or not (RAW_XLSX_FOLDER_ID and CSV_FOLDER_ID):
+            st.error("Missing Drive auth or folder IDs")
+        else:
+            rep = convert_all_xlsx_in_folder_to_csv(drv, RAW_XLSX_FOLDER_ID, CSV_FOLDER_ID)
+            st.success("Done")
+            st.dataframe(pd.DataFrame(rep))
+
+with tab_csv:
+    st.subheader("CSV files in Drive")
+    if drv and CSV_FOLDER_ID:
+        st.dataframe(pd.DataFrame(list_files_in_folder(drv, CSV_FOLDER_ID, CSV_MIME)))
+    else:
+        st.info("Enter CSV folder ID to list files")
+
+with tab_an:
+    st.subheader("Load a CSV from Drive for analysis")
+    if drv and CSV_FOLDER_ID:
+        items = list_files_in_folder(drv, CSV_FOLDER_ID, CSV_MIME)
+        options = {f["name"]: f["id"] for f in items}
+        pick = st.selectbox("Choose CSV", list(options.keys()))
+        if pick and st.button("Load selected"):
+            df = load_csv_from_drive(drv, options[pick])
+            st.write(df.head(50))
+            st.download_button("Download CSV", df.to_csv(index=False), file_name=pick, mime="text/csv")
+    else:
+        st.info("Enter CSV folder ID to continue")
